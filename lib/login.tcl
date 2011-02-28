@@ -36,7 +36,7 @@ if { ![info exists email] } {
     set email {}
 }
 
-if { [empty_string_p $email] && [empty_string_p $username] && [ad_conn untrusted_user_id] != 0 } {
+if { $email eq "" && $username eq "" && [ad_conn untrusted_user_id] != 0 } {
     acs_user::get -user_id [ad_conn untrusted_user_id] -array untrusted_user
     if { [auth::UseEmailForLoginP] } {
         set email $untrusted_user(email)
@@ -45,6 +45,9 @@ if { [empty_string_p $email] && [empty_string_p $username] && [ad_conn untrusted
         set username $untrusted_user(username)
     }
 }
+
+
+
 
 # Persistent login
 # The logic is: 
@@ -65,7 +68,12 @@ if { $allow_persistent_login_p } {
 set subsite_url [subsite::get_element -element url]
 set system_name [ad_system_name]
 
-if { ![exists_and_not_null return_url] } {
+if { [exists_and_not_null return_url] } {
+    if { [util::external_url_p $return_url] } {
+      ad_returnredirect -message "only urls without a host name are permitted" "."
+      ad_script_abort
+    }
+} else {
     set return_url [ad_pvt_home]
 }
 
@@ -77,13 +85,13 @@ if { ![exists_and_not_null authority_id] } {
 
 set forgotten_pwd_url [auth::password::get_forgotten_url -authority_id $authority_id -username $username -email $email]
 
-set register_url [export_vars -base "[subsite::get_element -element url]register/user-new" { return_url }]
-if { [string equal $authority_id [auth::get_register_authority]] || [auth::UseEmailForLoginP] } {
+set register_url [export_vars -base "[subsite::get_url]register/user-new" { return_url }]
+if { $authority_id eq [auth::get_register_authority] || [auth::UseEmailForLoginP] } {
     set register_url [export_vars -no_empty -base $register_url { username email }]
 }
 
 set login_button [list [list [_ acs-subsite.Log_In] ok]]
-ad_form -name login -html { style "margin: 0px;" } -show_required_p 0 -edit_buttons $login_button -action "/register/" -form {
+ad_form -name login -html { style "margin: 0px;" } -show_required_p 0 -edit_buttons $login_button -action "[subsite::get_url]register/" -form {
     {return_url:text(hidden)}
     {time:text(hidden)}
     {token_id:text(hidden)}
@@ -97,9 +105,9 @@ if { [parameter::get -parameter UsePasswordWidgetForUsername -package_id [ad_acs
 
 set focus {}
 if { [auth::UseEmailForLoginP] } {
-    ad_form -extend -name login -form [list [list email:text($username_widget),nospell [list label [_ acs-subsite.Email]]]]
+    ad_form -extend -name login -form [list [list email:text($username_widget),nospell [list label [_ acs-subsite.Email]] [list html [list style "width: 150px"]]]]
     set user_id_widget_name email
-    if { ![empty_string_p $email] } {
+    if { $email ne "" } {
         set focus "password"
     } else {
         set focus "email"
@@ -114,9 +122,9 @@ if { [auth::UseEmailForLoginP] } {
         }
     }
 
-    ad_form -extend -name login -form [list [list username:text($username_widget),nospell [list label [_ acs-subsite.Username]]]]
+    ad_form -extend -name login -form [list [list username:text($username_widget),nospell [list label [_ acs-subsite.Username]] [list html [list style "width: 150px"]]]]
     set user_id_widget_name username
-    if { ![empty_string_p $username] } {
+    if { $username ne "" } {
         set focus "password"
     } else {
         set focus "username"
@@ -127,6 +135,7 @@ set focus "login.$focus"
 ad_form -extend -name login -form {
     {password:text(password) 
         {label "[_ acs-subsite.Password]"}
+	{html {style "width: 150px"}}
     }
 }
 
@@ -161,14 +170,14 @@ ad_form -extend -name login -on_request {
     set token [sec_get_token $token_id]
     set computed_hash [ns_sha1 "$time$token_id$token"]
     
-    set expiration_time [parameter::get -parameter LoginExpirationTime -package_id [ad_acs_kernel_id] -default 600]
+    set expiration_time [parameter::get -parameter LoginPageExpirationTime -package_id [ad_acs_kernel_id] -default 600]
     if { $expiration_time < 30 } { 
         # If expiration_time is less than 30 seconds, it's practically impossible to login
         # and you will have completely hosed login on your entire site
         set expiration_time 30
     }
 
-    if { [string compare $hash $computed_hash] != 0 || \
+    if { $hash ne $computed_hash  || \
              $time < [ns_time] - $expiration_time } {
         ad_returnredirect -message [_ acs-subsite.Login_has_expired] -- [export_vars -base [ad_conn url] { return_url }]
         ad_script_abort
@@ -182,14 +191,21 @@ ad_form -extend -name login -on_request {
     if { ![exists_and_not_null persistent_p] } {
         set persistent_p "f"
     }
+    if {![element exists login email]} {
+	set email [ns_queryget email ""]
+    }
+    set first_names [ns_queryget first_names ""]
+    set last_name [ns_queryget last_name ""]
     
     array set auth_info [auth::authenticate \
                              -return_url $return_url \
                              -authority_id $authority_id \
                              -email [string trim $email] \
+                             -first_names $first_names \
+                             -last_name $last_name \
                              -username [string trim $username] \
                              -password $password \
-                             -persistent=[expr $allow_persistent_login_p && [template::util::is_true $persistent_p]]]
+                             -persistent=[expr {$allow_persistent_login_p && [template::util::is_true $persistent_p]}]]
     
     # Handle authentication problems
     switch $auth_info(auth_status) {
@@ -217,9 +233,44 @@ ad_form -extend -name login -on_request {
             # Continue below
         }
         default {
-            # Display the message on a separate page
-            ad_returnredirect [export_vars -base "[subsite::get_element -element url]register/account-closed" { { message $auth_info(account_message) } }]
-            ad_script_abort
+	    # if element_messages exists we try to get the element info
+	    if {[info exists auth_info(element_messages)]
+		&& [auth::authority::get_element \
+			-authority_id $authority_id \
+			-element allow_user_entered_info_p]} {
+		foreach message [lsort $auth_info(element_messages)] {
+		    ns_log notice "LOGIN $message"
+		    switch -glob -- $message {
+			*email* {
+ 			    if {[element exists login email]} {
+ 				set operation set_properties
+ 			    } else {
+ 				set operation create
+ 			    }
+			    element $operation login email -widget $username_widget -datatype text -label [_ acs-subsite.Email]
+			    if {[element error_p login email]} {
+				template::form::set_error login email [_ acs-subsite.Email_not_provided_by_authority]
+			    }
+			}
+			*first* {
+			    element create login first_names -widget text -datatype text -label [_ acs-subsite.First_names]
+			    template::form::set_error login email [_ acs-subsite.First_names_not_provided_by_authority]
+			}
+			*last* {
+			    element create login last_name -widget text -datatype text -label [_ acs-subsite.Last_name]
+			    template::form::set_error login last_name [_ acs-subsite.Last_name_not_provided_by_authority]
+			}
+		    }
+		}
+		set auth_info(account_message) ""
+		    
+		ad_return_template
+		
+	    } else {
+		# Display the message on a separate page
+		ad_returnredirect [export_vars -base "[subsite::get_element -element url]register/account-closed" { { message $auth_info(account_message) } }]
+		ad_script_abort
+	    }
         }
     }
 } -after_submit {
@@ -231,8 +282,10 @@ ad_form -extend -name login -on_request {
         ad_returnredirect [export_vars -base "[subsite::get_element -element url]register/account-message" { { message $auth_info(account_message) } return_url }]
         ad_script_abort
     } else {
-        # No message
-        ad_returnredirect $return_url
-        ad_script_abort
-   }
+	if {![info exists auth_info(element_messages)]} {
+	    # No message
+	    ad_returnredirect $return_url
+	    ad_script_abort
+	}
+    }
 }
